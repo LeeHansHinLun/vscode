@@ -14,7 +14,7 @@ import { isCancellationError } from '../../../../util/vs/base/common/errors';
 import { Emitter, Event } from '../../../../util/vs/base/common/event';
 import { Iterable } from '../../../../util/vs/base/common/iterator';
 import { Lazy } from '../../../../util/vs/base/common/lazy';
-import { Disposable, DisposableStore, IDisposable } from '../../../../util/vs/base/common/lifecycle';
+import { Disposable, IDisposable } from '../../../../util/vs/base/common/lifecycle';
 import { ResourceMap } from '../../../../util/vs/base/common/map';
 import { isEqual, isEqualOrParent } from '../../../../util/vs/base/common/resources';
 import { StopWatch } from '../../../../util/vs/base/common/stopwatch';
@@ -24,7 +24,7 @@ import { ChatResponseWarningPart } from '../../../../vscodeTypes';
 import { IAuthenticationService } from '../../../authentication/common/authentication';
 import { IAuthenticationChatUpgradeService } from '../../../authentication/common/authenticationUpgrade';
 import { FileChunkAndScore } from '../../../chunking/common/chunk';
-import { ConfigKey, ConfigTarget, IConfigurationService } from '../../../configuration/common/configurationService';
+import { ConfigKey, IConfigurationService } from '../../../configuration/common/configurationService';
 import { EmbeddingType } from '../../../embeddings/common/embeddingsComputer';
 import { RelativePattern } from '../../../filesystem/common/fileTypes';
 import { IGitService, ResolvedRepoRemoteInfo } from '../../../git/common/gitService';
@@ -40,9 +40,7 @@ import { ITelemetryService } from '../../../telemetry/common/telemetry';
 import { IWorkspaceService } from '../../../workspace/common/workspaceService';
 import { StrategySearchResult, StrategySearchSizing, WorkspaceChunkQueryWithEmbeddings, WorkspaceChunkSearchOptions } from '../../common/workspaceChunkSearch';
 import { IWorkspaceFileIndex } from '../workspaceFileIndex';
-import { AdoCodeSearchRepo, BuildIndexTriggerReason, CodeSearchRepo, CodeSearchRepoStatus, GithubCodeSearchRepo, TriggerIndexingError, TriggerRemoteIndexingError } from './codeSearchRepo';
-import { ExternalIngestClient } from './externalIngestClient';
-import { ExternalIngestIndex, ExternalIngestStatus } from './externalIngestIndex';
+import { BuildIndexTriggerReason, CodeSearchRepo, CodeSearchRepoStatus, TriggerIndexingError, TriggerRemoteIndexingError } from './codeSearchRepo';
 import { CodeSearchRepoTracker, RepoInfo, TrackedRepoStatus } from './repoTracker';
 import { CodeSearchDiff, CodeSearchWorkspaceDiffTracker } from './workspaceDiff';
 
@@ -60,11 +58,6 @@ export interface CodeSearchRemoteIndexState {
 	readonly externalIngestEnablement?: ExternalIngestEnablement;
 
 	readonly hasPromptedForExternalIngest?: boolean;
-
-	/**
-	 * Status of external ingest indexing for files not covered by code search.
-	 */
-	readonly externalIngestState?: ExternalIngestStatus;
 }
 
 export const enum ExternalIngestEnablement {
@@ -133,10 +126,6 @@ export class CodeSearchChunkSearch extends Disposable {
 
 	private readonly _repoTracker: CodeSearchRepoTracker;
 
-	private readonly _externalIngestIndex: Lazy<ExternalIngestIndex>;
-
-	private _externalIngestIndexStateListener: IDisposable | undefined;
-
 	constructor(
 		private readonly _embeddingType: EmbeddingType,
 		@IInstantiationService instantiationService: IInstantiationService,
@@ -145,7 +134,6 @@ export class CodeSearchChunkSearch extends Disposable {
 		@IAuthenticationService private readonly _authenticationService: IAuthenticationService,
 		@ICodeSearchAuthenticationService private readonly _codeSearchAuthService: ICodeSearchAuthenticationService,
 		@IConfigurationService private readonly _configService: IConfigurationService,
-		@IInstantiationService private readonly _instantiationService: IInstantiationService,
 		@IExperimentationService private readonly _experimentationService: IExperimentationService,
 		@IGitService private readonly _gitService: IGitService,
 		@ILogService private readonly _logService: ILogService,
@@ -156,10 +144,6 @@ export class CodeSearchChunkSearch extends Disposable {
 		super();
 
 		this._repoTracker = this._register(instantiationService.createInstance(CodeSearchRepoTracker));
-		this._externalIngestIndex = new Lazy(() => {
-			const client = instantiationService.createInstance(ExternalIngestClient);
-			return this._register(instantiationService.createInstance(ExternalIngestIndex, client, this.getExternalIngestRoots()));
-		});
 
 		this._register(this._repoTracker.onDidAddOrUpdateRepo(info => {
 			if (info.status === TrackedRepoStatus.Resolved && info.resolvedRemoteInfo) {
@@ -222,11 +206,6 @@ export class CodeSearchChunkSearch extends Disposable {
 				return;
 			}
 
-			if (this.isExternalIngestEnabled()) {
-				void this.ensureExternalIngestInitialized().finally(() => this._onDidChangeIndexState.fire());
-				return;
-			}
-
 			this._onDidChangeIndexState.fire();
 		}));
 
@@ -246,7 +225,6 @@ export class CodeSearchChunkSearch extends Disposable {
 		this._codeSearchRepos.clear();
 	}
 
-	private _hasFinishedInitialization = false;
 	private _initializePromise: Promise<void> | undefined;
 
 	@LogExecTime(self => self._logService, 'CodeSearchChunkSearch::initialize')
@@ -266,44 +244,12 @@ export class CodeSearchChunkSearch extends Disposable {
 					if (this._isDisposed) {
 						return;
 					}
-
-					await this.ensureExternalIngestInitialized();
 				} finally {
-					this._hasFinishedInitialization = true;
 					this._onDidFinishInitialization.fire();
 				}
 			});
 		})();
 		await this._initializePromise;
-	}
-
-	private getExternalIngestRoots(): URI[] {
-		return Array.from(this._codeSearchRepos.values())
-			.filter(entry => entry.repo.status === CodeSearchRepoStatus.Ready)
-			.map(entry => entry.repo.repoInfo.rootUri);
-	}
-
-	private updateExternalIngestRoots(): void {
-		this._externalIngestIndex.rawValue?.updateCodeSearchRoots(this.getExternalIngestRoots());
-	}
-
-	private async ensureExternalIngestInitialized(): Promise<void> {
-		if (!this.isExternalIngestEnabled()) {
-			return;
-		}
-
-		this.updateExternalIngestRoots();
-		if (!this._externalIngestIndexStateListener) {
-			this._externalIngestIndexStateListener = this._register(this._externalIngestIndex.value.onDidChangeState(() => {
-				this._onDidChangeIndexState.fire();
-			}));
-		}
-
-		await this._externalIngestIndex.value.initialize();
-	}
-
-	private isInitializing(): boolean {
-		return !this._hasFinishedInitialization;
 	}
 
 	@LogExecTime(self => self._logService, 'CodeSearchChunkSearch::isAvailable')
@@ -313,8 +259,6 @@ export class CodeSearchChunkSearch extends Disposable {
 		if (this._isDisposed) {
 			return false;
 		}
-
-		const hasExternalIngest = !!this.isExternalIngestEnabled();
 
 		// Track where indexed repos are located related to the workspace
 		const indexedRepoLocation = {
@@ -348,7 +292,6 @@ export class CodeSearchChunkSearch extends Disposable {
 				"codeSearchUnavailableReason": { "classification": "SystemMetaData", "purpose": "FeatureInsight",  "comment": "Reason why code search is unavailable" },
 				"repoStatues": { "classification": "SystemMetaData", "purpose": "FeatureInsight",  "comment": "Detailed info about the statues of the repos in the workspace" },
 				"execTime": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true, "comment": "How long the check too to complete" },
-				"hasExternalIngest": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true, "comment": "Whether external ingest is enabled" },
 				"indexedRepoCount": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true, "comment": "Number of indexed repositories" },
 				"notYetIndexedRepoCount": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true, "comment": "Number of repositories that have not yet been indexed" },
 
@@ -365,7 +308,6 @@ export class CodeSearchChunkSearch extends Disposable {
 			repoStatues: JSON.stringify(codeSearchCheckResult.isOk() ? codeSearchCheckResult.val.repoStatuses : codeSearchCheckResult.err.repoStatuses),
 		}, {
 			execTime: sw.elapsed(),
-			hasExternalIngest: hasExternalIngest ? 1 : 0,
 			indexedRepoCount: codeSearchCheckResult.isOk() ? codeSearchCheckResult.val.indexedRepos.length : 0,
 			notYetIndexedRepoCount: codeSearchCheckResult.isOk() ? codeSearchCheckResult.val.notYetIndexedRepos.length : 0,
 			'indexedRepoLocation.workspace': indexedRepoLocation.workspaceFolder,
@@ -383,13 +325,7 @@ export class CodeSearchChunkSearch extends Disposable {
 			return true;
 		}
 
-		if (hasExternalIngest) {
-			this._logService.debug(`CodeSearchChunkSearch.isAvailable: true since external ingest is enabled`);
-		} else {
-			this._logService.debug(`CodeSearchChunkSearch.isAvailable: false since external ingest is not enabled and no code search repos found`);
-		}
-
-		return hasExternalIngest;
+		return false;
 	}
 
 	private async isCodeSearchAvailable(canPrompt = false, token: CancellationToken): Promise<Result<AvailableSuccessMetadata, AvailableFailureMetadata>> {
@@ -468,105 +404,6 @@ export class CodeSearchChunkSearch extends Disposable {
 		return this._configService.getExperimentBasedConfig<boolean>(ConfigKey.Advanced.WorkspaceEnableCodeSearch, this._experimentationService);
 	}
 
-	public isExternalIngestEnabled(): boolean | 'force' {
-		if (!this.canExternalIngestBeEnabled()) {
-			return false;
-		}
-
-		return this._configService.getExperimentBasedConfig<boolean>(ConfigKey.Advanced.WorkspaceEnableCodeSearchExternalIngest, this._experimentationService);
-	}
-
-	public canExternalIngestBeEnabled(): boolean {
-		return !!this._authenticationService.copilotToken?.isBlackbirdExternalIndexingEnabled();
-	}
-
-	public getExternalIngestEnablement(): ExternalIngestEnablement {
-		if (!this.canExternalIngestBeEnabled()) {
-			return ExternalIngestEnablement.DisabledByPolicy;
-		}
-
-		return this.isExternalIngestEnabled() ? ExternalIngestEnablement.Enabled : ExternalIngestEnablement.DisabledBySetting;
-	}
-
-	public async enableExternalIngest(): Promise<boolean> {
-		if (!this.canExternalIngestBeEnabled()) {
-			return false;
-		}
-
-		await this._configService.setConfig(ConfigKey.Advanced.WorkspaceEnableCodeSearchExternalIngest, true, ConfigTarget.Workspace);
-		await this.initialize();
-		await this.ensureExternalIngestInitialized();
-		this._onDidChangeIndexState.fire();
-		return true;
-	}
-
-	public getRemoteIndexState(hasPromptedForExternalIngest: boolean): CodeSearchRemoteIndexState {
-		const externalIngestEnablement = this.getExternalIngestEnablement();
-		if (!this.isCodeSearchEnabled() && !this.isExternalIngestEnabled()) {
-			return {
-				status: 'disabled',
-				repos: [],
-				externalIngestEnablement,
-				hasPromptedForExternalIngest,
-			};
-		}
-
-		// Kick of request but do not wait for it to finish
-		this.initialize();
-
-		// Get external ingest state if enabled
-		const externalIngestState = this.isExternalIngestEnabled() && this._externalIngestIndex.hasValue
-			? this._externalIngestIndex.value.getState()
-			: undefined;
-
-		if (this.isInitializing()) {
-			return {
-				status: 'initializing',
-				repos: [],
-				externalIngestEnablement,
-				hasPromptedForExternalIngest,
-				externalIngestState,
-			};
-		}
-
-		if (this.isExternalIngestEnabled() === 'force') {
-			return {
-				status: 'loaded',
-				repos: [],
-				externalIngestEnablement,
-				hasPromptedForExternalIngest,
-				externalIngestState,
-			};
-		}
-
-		const trackedRepos = this._repoTracker.getAllTrackedRepos();
-		if (trackedRepos) {
-			const resolving = trackedRepos.some(repo => repo.status === TrackedRepoStatus.Resolving);
-			if (resolving) {
-				return {
-					status: 'initializing',
-					repos: [],
-					externalIngestEnablement,
-					hasPromptedForExternalIngest,
-					externalIngestState,
-				};
-			}
-		}
-
-		const resolvedRepos = Array.from(this._codeSearchRepos.values(), entry => entry.repo)
-			.filter(repo => repo.status !== CodeSearchRepoStatus.NotResolvable);
-
-		const repos = resolvedRepos.map((repo): RepoEntry => ({ info: repo.repoInfo, remoteInfo: repo.remoteInfo, status: repo.status }));
-
-		return {
-			status: 'loaded',
-			repos,
-			externalIngestEnablement,
-			hasPromptedForExternalIngest,
-			externalIngestState,
-		};
-	}
-
 	public async *getDiagnosticsDump(): AsyncIterable<string> {
 		await this._initializePromise;
 
@@ -592,25 +429,6 @@ export class CodeSearchChunkSearch extends Disposable {
 				yield `  - Diff file count: ${diffInfo?.diffFileCount ?? 0}\n`;
 			}
 			yield '\n';
-		}
-
-		// External ingest
-		yield '## External Ingest\n\n';
-		if (this.isExternalIngestEnabled() && this._externalIngestIndex.hasValue) {
-			const index = this._externalIngestIndex.value;
-			const state = index.getState();
-			const diagnostics = index.getDiagnostics();
-			yield `Status: ${state.status}\n`;
-			yield `File count: ${diagnostics.fileCount}\n\n`;
-			if (diagnostics.fileCount > 0) {
-				yield '### Files\n\n';
-				for (const file of diagnostics.files) {
-					yield `- ${file.fsPath}\n`;
-				}
-				yield '\n';
-			}
-		} else {
-			yield 'External ingest is not enabled or not initialized.\n\n';
 		}
 	}
 
@@ -769,27 +587,6 @@ export class CodeSearchChunkSearch extends Disposable {
 	}
 
 	private async searchLocalDiff(diffArray: LocalDiffResult, sizing: StrategySearchSizing, query: WorkspaceChunkQueryWithEmbeddings, options: WorkspaceChunkSearchOptions, telemetryInfo: TelemetryCorrelationId, token: CancellationToken): Promise<DiffSearchResult | undefined> {
-		const innerTelemetryInfo = telemetryInfo.addCaller('CodeSearchChunkSearch::searchLocalDiff');
-
-		if (!this.isExternalIngestEnabled()) {
-			return undefined;
-		}
-
-		if (Array.isArray(diffArray)) {
-			// Force it to search the local diff too so we can override stale code-search results.
-			await raceCancellationError(this._externalIngestIndex.value.updateForceIncludeFiles(diffArray, token), token);
-		}
-
-		const externalResult = await this._externalIngestIndex.value.search(sizing, query, innerTelemetryInfo, token);
-		if (externalResult) {
-			if (!Array.isArray(diffArray)) {
-				return { chunks: externalResult, strategyId: 'externalIngest' };
-			}
-
-			const diffFilePattern = diffArray.map(uri => new RelativePattern(uri, '*'));
-			const filtered = externalResult.filter(x => shouldInclude(x.chunk.file, { include: diffFilePattern }));
-			return { chunks: filtered, strategyId: 'externalIngest' };
-		}
 		return undefined;
 	}
 
@@ -867,46 +664,8 @@ export class CodeSearchChunkSearch extends Disposable {
 			}
 		}
 
-		if (remoteInfo.repoId.type === 'github') {
-			this.updateRepoEntry(repo, this._instantiationService.createInstance(GithubCodeSearchRepo, repo, remoteInfo.repoId, remoteInfo));
-			// Update external ingest roots since this repo is now covered by code search
-			if (this.isExternalIngestEnabled() === true) {
-				this.updateExternalIngestRoots();
-			}
-			return;
-		} else if (remoteInfo.repoId.type === 'ado') {
-			this.updateRepoEntry(repo, this._instantiationService.createInstance(AdoCodeSearchRepo, repo, remoteInfo.repoId, remoteInfo));
-			// Update external ingest roots since this repo is now covered by code search
-			if (this.isExternalIngestEnabled() === true) {
-				this.updateExternalIngestRoots();
-			}
-			return;
-		}
-
 		// For unsupported repo types, the external ingest index will handle the files
 		this._logService.trace(`CodeSearchChunkSearch.openGitRepo: Repo type ${remoteInfo.repoId} not directly supported for code search, files will be indexed via external ingest`);
-	}
-
-	private updateRepoEntry(repoInfo: RepoInfo, newEntry: CodeSearchRepo) {
-		const existing = this._codeSearchRepos.get(repoInfo.rootUri);
-		if (existing?.repo === newEntry) {
-			return;
-		}
-
-		existing?.repo.dispose();
-		existing?.disposables.dispose();
-
-		const disposables = new DisposableStore();
-		disposables.add(newEntry.onDidChangeStatus(() => {
-			this._onDidChangeIndexState.fire();
-		}));
-
-		this._codeSearchRepos.set(repoInfo.rootUri, { repo: newEntry, disposables });
-		this._onDidAddOrUpdateCodeSearchRepo.fire({
-			info: newEntry.repoInfo,
-			remoteInfo: newEntry.remoteInfo,
-			status: newEntry.status,
-		});
 	}
 
 	private closeRepo(repo: RepoInfo) {
@@ -933,20 +692,6 @@ export class CodeSearchChunkSearch extends Disposable {
 
 		await this.initialize();
 
-		// Update external ingest index if enabled
-		const externalIndexEnabled = this.isExternalIngestEnabled();
-		if (externalIndexEnabled) {
-			const result = await raceCancellationError(this._externalIngestIndex.value.doIngest(telemetryInfo, onProgress, token), token);
-			if (result.isError()) {
-				return Result.error(result.err);
-			}
-
-			// If we are forcing external ingest only, we don't care about code search repo states
-			if (externalIndexEnabled === 'force') {
-				return Result.ok(true);
-			}
-		}
-
 		this._logService.trace(`RepoTracker.TriggerRemoteIndexing(${triggerReason}).Repos: ${JSON.stringify(Array.from(this._codeSearchRepos.values(), entry => ({
 			rootUri: entry.repo.repoInfo.rootUri.toString(),
 			status: entry.repo.status,
@@ -962,13 +707,6 @@ export class CodeSearchChunkSearch extends Disposable {
 		}
 
 		const allRepos = Array.from(this._codeSearchRepos.values(), entry => entry.repo);
-		if (!allRepos.length || allRepos.every(repo => repo.status === CodeSearchRepoStatus.NotResolvable)) {
-			if (externalIndexEnabled) {
-				return Result.ok(true);
-			} else {
-				return Result.error(TriggerRemoteIndexingError.notIndexable);
-			}
-		}
 
 		if (allRepos.every(repo => repo.status === CodeSearchRepoStatus.Resolving)) {
 			return Result.error(TriggerRemoteIndexingError.stillResolving);
@@ -1072,9 +810,5 @@ export class CodeSearchChunkSearch extends Disposable {
 		}
 
 		return undefined;
-	}
-
-	public deleteExternalIngestWorkspaceIndex(telemetryInfo: TelemetryCorrelationId, token: CancellationToken): Promise<void> {
-		return this._externalIngestIndex.value.deleteIndex(telemetryInfo, token);
 	}
 }

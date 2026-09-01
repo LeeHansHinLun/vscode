@@ -23,7 +23,6 @@ suite('MicButtonHovers', () => {
 			onDevice: getDictationHoverMarkdown('Dictate', onDevice).value,
 			cloud: getDictationHoverMarkdown('Dictate', cloud).value,
 		}, {
-			onDevice: '**Dictate**\n\nTypes what you say into the input. Transcribes on-device with the Nemotron 3.5 ASR multilingual model.',
 			cloud: '**Dictate**\n\nTypes what you say into the input. Transcribes in the cloud with the MAI speech model.',
 		});
 	});

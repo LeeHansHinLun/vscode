@@ -7,7 +7,6 @@ import { IManagedHoverContent } from '../../../../../base/browser/ui/hover/hover
 import { escapeMarkdownSyntaxTokens, MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { localize } from '../../../../../nls.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
-import { DEFAULT_LOCAL_TRANSCRIPTION_MODEL } from '../../../../../platform/localTranscription/common/localTranscription.js';
 import { DICTATION_MAI_MODEL_ID, DICTATION_MODEL_SETTING } from './chatSpeechToTextService.js';
 
 /**
@@ -36,9 +35,6 @@ function getDictationDescription(configurationService: IConfigurationService): s
 	const modelId = configurationService.getValue<string>(DICTATION_MODEL_SETTING)?.trim();
 	if (modelId === DICTATION_MAI_MODEL_ID) {
 		return localize('dictation.hover.cloud', "Types what you say into the input. Transcribes in the cloud with the MAI speech model.");
-	}
-	if (!modelId || modelId === DEFAULT_LOCAL_TRANSCRIPTION_MODEL) {
-		return localize('dictation.hover.nemotronMultilingual', "Types what you say into the input. Transcribes on-device with the Nemotron 3.5 ASR multilingual model.");
 	}
 	return localize('dictation.hover.onDevice', "Types what you say into the input. Transcribes on-device with {0}.", modelId);
 }

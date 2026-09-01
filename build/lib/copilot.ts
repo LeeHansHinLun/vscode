@@ -109,7 +109,6 @@ function toCopilotPackagePlatformArch(platform: string, arch: string): string {
 
 const copilotOptionalNativePayloadDirs = [
 	'clipboard',
-	'foundry-local-sdk',
 	'mxc-bin',
 	'pvrecorder',
 	'webview',
